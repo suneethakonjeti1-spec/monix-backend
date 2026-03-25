@@ -1,26 +1,26 @@
+require('dotenv').config(); 
 const express = require('express');
 const multer = require('multer');
 const PDFParser = require("pdf2json"); 
-const fs = require('fs');
 const cors = require('cors');
 const { GoogleGenAI } = require('@google/genai');
 
 const app = express();
 app.use(cors());
-// Increased JSON limit so the frontend can send transaction history back for AI analysis
 app.use(express.json({ limit: '50mb' })); 
 
-const upload = multer({ dest: 'uploads/' });
+// 🌟 THE FIX: Store the uploaded file directly in RAM (Memory) instead of a folder
+const upload = multer({ storage: multer.memoryStorage() });
 
-// 🛑 KEEP YOUR API KEY HERE:
-const ai = new GoogleGenAI({ apiKey: 'AIzaSyCofMAbVn_RqtXSPyenoUFfqUwKU0P8nzQ' }); 
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }); 
 
-function extractTextFromPDF(filePath) {
+// 🌟 THE FIX: Parse the PDF directly from the memory buffer
+function extractTextFromPDF(pdfBuffer) {
     return new Promise((resolve, reject) => {
         const pdfParser = new PDFParser(null, 1); 
         pdfParser.on("pdfParser_dataError", errData => reject(errData.parserError));
         pdfParser.on("pdfParser_dataReady", () => { resolve(pdfParser.getRawTextContent()); });
-        pdfParser.loadPDF(filePath);
+        pdfParser.parseBuffer(pdfBuffer); // Read from RAM!
     });
 }
 
@@ -33,13 +33,12 @@ app.post('/upload', upload.single('pdfFile'), async (req, res) => {
         console.log("📥 NEW REQUEST RECEIVED!");
         
         if (!req.file || req.file.mimetype !== 'application/pdf') {
-            if (req.file) fs.unlinkSync(req.file.path);
             return res.status(400).json({ error: "Only PDF files are allowed." });
         }
         
-        console.log("✅ File is a valid PDF. Extracting...");
-        let extractedText = await extractTextFromPDF(req.file.path); 
-        fs.unlinkSync(req.file.path); 
+        console.log("✅ File is a valid PDF. Extracting from Memory...");
+        // 🌟 THE FIX: Pass the buffer directly to our function
+        let extractedText = await extractTextFromPDF(req.file.buffer); 
 
         console.log("🧠 Step 2: Sending to Gemini AI...");
         const prompt = `
@@ -68,7 +67,6 @@ app.post('/upload', upload.single('pdfFile'), async (req, res) => {
             if (lastValidBracket !== -1) { cleanJSON = cleanJSON.substring(0, lastValidBracket + 1) + "]"; }
         }
 
-        // Send directly back to frontend, NO saving to local DB!
         res.json(JSON.parse(cleanJSON));
 
     } catch (error) {
@@ -83,7 +81,6 @@ app.post('/upload', upload.single('pdfFile'), async (req, res) => {
 app.post('/chat', async (req, res) => {
     try {
         console.log("💬 Chatbot analyzing context...");
-        // Frontend now passes the history context inside the request!
         const { question, history } = req.body; 
         
         const prompt = `You are Monix, a helpful financial assistant. 
@@ -101,7 +98,7 @@ app.post('/chat', async (req, res) => {
 app.post('/predict', async (req, res) => {
     try {
         console.log("🔮 Predicting future bills...");
-        const { history } = req.body; // Frontend passes history
+        const { history } = req.body; 
         
         const prompt = `Analyze this transaction history: ${JSON.stringify(history)}. 
         Identify recurring expenses. Predict exactly 3 bills the user will likely have to pay next month.
@@ -118,8 +115,8 @@ app.post('/predict', async (req, res) => {
     } catch (error) { res.status(500).json({ error: "Prediction engine failed." }); }
 });
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log(`\n🚀 Stateless Server running on http://localhost:${PORT}`);
+    console.log(`\n🚀 Secure Stateless Server running on port ${PORT}`);
     console.log(`Waiting for Frontend Requests...\n`);
 });
