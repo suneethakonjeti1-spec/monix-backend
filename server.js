@@ -129,7 +129,7 @@ app.get('/health', (_req, res) => {
 });
 
 // ─── ROUTE: Upload PDF ─────────────────────────────────────────
-app.post('/api/upload', uploadLimiter, requireAuth, upload.single('pdfFile'), async (req, res) => {
+app.post('/upload', uploadLimiter, requireAuth, upload.single('pdfFile'), async (req, res) => {
     try {
         const uid = req.user?.uid ?? 'dev';
         console.log(`📥 /upload | uid:${uid} | file:${req.file?.originalname}`);
@@ -211,7 +211,7 @@ app.use((err, req, res, next) => {
 });
 
 // ─── ROUTE: Chat ───────────────────────────────────────────────
-app.post('/api/chat', chatLimiter, requireAuth, async (req, res) => {
+app.post('/chat', chatLimiter, requireAuth, async (req, res) => {
     try {
         const { question, history = [], roastMode = false } = req.body;
 
@@ -244,7 +244,7 @@ Question: ${question}`;
 });
 
 // ─── ROUTE: Predict ────────────────────────────────────────────
-app.post('/api/predict', requireAuth, async (req, res) => {
+app.post('/predict', requireAuth, async (req, res) => {
     try {
         const { history = [] } = req.body;
         if (history.length < 5) return res.json([]);
