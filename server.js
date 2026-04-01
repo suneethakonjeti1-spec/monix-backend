@@ -150,20 +150,30 @@ app.post('/upload', uploadLimiter, requireAuth, upload.single('pdfFile'), async 
             return res.status(422).json({ error: 'PDF appears empty or has no readable text.' });
         }
 
-        const prompt = `You are a financial AI specializing in Indian bank and UPI wallet statements.
-
+        const prompt = `You are an expert financial AI specializing in Indian bank statements.
 Extract ALL transactions from the text. Follow these rules exactly:
 
-1. Include "Opening Balance" if present — treat as a positive (credit) transaction.
-2. Extract only actual money movements. Ignore running balance columns.
-3. Debits = NEGATIVE numbers. Credits = POSITIVE numbers.
-4. Assign exactly one category from: "Utilities" | "Salary" | "Food & Dining" | "Shopping" | "Auto & Transport" | "Entertainment" | "Transfers & Loans" | "Groceries" | "UPI Payment" | "Other"
-5. Date format: YYYY-MM-DD. Infer year from context if missing.
-6. description: plain text only, no quotes, no backslashes, max 120 chars.
-7. Return ONLY a valid JSON array. No markdown. No explanation. Each item: { "date", "description", "amount", "category" }
+CRITICAL RULES FOR DEBITS vs CREDITS:
+The text columns are mixed up. You MUST use the running balance (the last number in the row) to determine if the transaction amount is a Debit (-) or Credit (+).
+1. If the balance DECREASES from the previous row = DEBIT (return as a NEGATIVE number).
+2. If the balance INCREASES from the previous row = CREDIT (return as a POSITIVE number).
+
+OPENING BALANCE INSTRUCTION:
+3. You MUST include the "OPENING BALANCE" as the very first transaction. Treat it as a POSITIVE number (Credit) and categorize it as "Other".
+4. Ignore "CLOSING BALANCE" and "TRANSACTION TOTAL" rows.
+
+CONTEXT CLUES (Axis Bank):
+- "UPI/P2M", "UPI/P2A", "Car ch", "Tifin" are almost always DEBITS (-)
+- "ACH-CR", "Int.Pd", and "RTGS/NEFT...LOAN RETURN" are CREDITS (+)
+
+OTHER RULES:
+5. Assign exactly one category from: "Utilities" | "Salary" | "Food & Dining" | "Shopping" | "Auto & Transport" | "Entertainment" | "Transfers & Loans" | "Groceries" | "UPI Payment" | "Other"
+6. Date format: YYYY-MM-DD.
+7. description: plain text only, no quotes, max 120 chars.
+8. Return ONLY a valid JSON array. No markdown. Each item: { "date", "description", "amount", "category" }
 
 Statement:
-${text.slice(0, 12000)}`; // cap to avoid token overflow
+${text.slice(0, 15000)}`;
 
         let aiText;
         try {
