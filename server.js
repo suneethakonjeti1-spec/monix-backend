@@ -10,7 +10,8 @@ const admin      = require('firebase-admin');
 
 // ─── App ──────────────────────────────────────────────────────
 const app = express();
-
+app.set('trust proxy', 1);
+app.use(morgan('tiny'));
 // Request logging (tiny format for production — no sensitive data)
 app.use(morgan('[:date[clf]] :method :url :status :res[content-length] - :response-time ms'));
 
