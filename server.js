@@ -11,9 +11,7 @@ const admin      = require('firebase-admin');
 // ─── App ──────────────────────────────────────────────────────
 const app = express();
 app.set('trust proxy', 1);
-app.use(morgan('tiny'));
-// Request logging (tiny format for production — no sensitive data)
-app.use(morgan('[:date[clf]] :method :url :status :res[content-length] - :response-time ms'));
+app.use(morgan('tiny')); // request logging
 
 // CORS — restrict to your actual frontend origin in production
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '*').split(',').map(s => s.trim());
@@ -43,12 +41,18 @@ const uploadLimiter = rateLimit({
 });
 
 const chatLimiter = rateLimit({
-    windowMs: 60 * 1000, 
-    max: 20,             
+    windowMs: 60 * 1000,
+    max: 20,
     message: { error: 'Slow down! Max 20 messages per minute.' },
 });
 
-app.use('/api/', apiLimiter);
+const predictLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 10,
+    message: { error: 'Too many prediction requests.' },
+});
+
+app.use(apiLimiter); // applies globally to all routes
 
 // ─── Firebase Admin ────────────────────────────────────────────
 let adminInitialized = false;
@@ -300,7 +304,7 @@ Question: ${question}`;
 });
 
 // ─── ROUTE: Predict ────────────────────────────────────────────
-app.post('/predict', requireAuth, async (req, res) => {
+app.post('/predict', predictLimiter, requireAuth, async (req, res) => {
     try {
         const { history = [] } = req.body;
         if (history.length < 5) return res.json([]);
