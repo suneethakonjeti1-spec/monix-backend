@@ -28,24 +28,23 @@ app.use(cors({
 app.use(express.json({ limit: '1mb' }));
 
 // ─── Rate Limiting ─────────────────────────────────────────────
-// Generous limits — tighten once you know your real traffic
 const apiLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000, // 15 minutes
-    max: 60,                   // 60 requests per IP per window
+    windowMs: 15 * 60 * 1000, 
+    max: 60,                   
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests. Please wait a few minutes and try again.' },
 });
 
 const uploadLimiter = rateLimit({
-    windowMs: 60 * 60 * 1000, // 1 hour
-    max: 10,                   // max 10 PDF uploads per IP per hour
+    windowMs: 60 * 60 * 1000, 
+    max: 10,                   
     message: { error: 'Upload limit reached. You can upload up to 10 statements per hour.' },
 });
 
 const chatLimiter = rateLimit({
-    windowMs: 60 * 1000, // 1 minute
-    max: 20,             // 20 chat messages per minute per IP
+    windowMs: 60 * 1000, 
+    max: 20,             
     message: { error: 'Slow down! Max 20 messages per minute.' },
 });
 
@@ -81,8 +80,34 @@ const upload = multer({
     },
 });
 
-// ─── Gemini ────────────────────────────────────────────────────
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ─── API KEY ROTATION ENGINE ───────────────────────────────────
+// Grabs the 3 keys from Render. If any are missing, it filters them out.
+const API_KEYS = [
+    process.env.GEMINI_KEY_1,
+    process.env.GEMINI_KEY_2,
+    process.env.GEMINI_KEY_3,
+    process.env.GEMINI_API_KEY // Fallback to your original key just in case
+].filter(key => key && key.trim() !== '');
+
+let currentKeyIndex = 0;
+
+function getActiveKey() {
+    if (API_KEYS.length === 0) {
+        console.error("🚨 CRITICAL ERROR: NO API KEYS FOUND IN ENVIRONMENT VARIABLES.");
+        return null;
+    }
+    return API_KEYS[currentKeyIndex];
+}
+
+function rotateKey() {
+    if (API_KEYS.length <= 1) return; // Can't rotate if we only have 1 key
+    currentKeyIndex++;
+    if (currentKeyIndex >= API_KEYS.length) {
+        currentKeyIndex = 0; // Loop back to the beginning
+    }
+    console.log(`🔄 AI Limit hit! Switched to API Key #${currentKeyIndex + 1}`);
+}
+// ───────────────────────────────────────────────────────────────
 
 // ─── Auth Middleware ───────────────────────────────────────────
 async function requireAuth(req, res, next) {
@@ -126,6 +151,7 @@ app.get('/health', (_req, res) => {
         timestamp: new Date().toISOString(),
         auth: adminInitialized ? 'firebase-admin' : 'dev-bypass',
         version: '2.1.0',
+        activeKeysCount: API_KEYS.length
     });
 });
 
@@ -177,6 +203,9 @@ ${text.slice(0, 15000)}`;
 
         let aiText;
         try {
+            // INITIALIZE AI WITH THE ACTIVE KEY
+            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
+            
             const r = await ai.models.generateContent({
                 model: 'gemini-2.5-flash',
                 contents: [{ role: 'user', parts: [{ text: prompt }] }],
@@ -185,6 +214,11 @@ ${text.slice(0, 15000)}`;
             aiText = r.text;
         } catch (e) {
             console.error('Gemini error:', e.message);
+            // CHECK FOR RATE LIMITS AND ROTATE
+            if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
+                rotateKey();
+                return res.status(502).json({ error: 'AI servers busy. Key rotated! Please click upload again.' });
+            }
             return res.status(502).json({ error: 'AI service unavailable. Please try again shortly.' });
         }
 
@@ -245,8 +279,19 @@ Context:
 
 Question: ${question}`;
 
-        const r = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
-        res.json({ answer: r.text });
+        try {
+            // INITIALIZE AI WITH THE ACTIVE KEY
+            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
+            const r = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
+            res.json({ answer: r.text });
+        } catch (e) {
+            console.error('Gemini chat error:', e.message);
+            if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
+                rotateKey();
+                return res.status(502).json({ error: 'AI busy. Key rotated! Try asking again.' });
+            }
+            throw e; // pass to outer catch
+        }
 
     } catch (err) {
         console.error('/chat error:', err);
@@ -270,11 +315,24 @@ Rules:
 3. Use real names (e.g. "Netflix Subscription", "Electricity Bill", "Gym Membership").
 4. Return ONLY a valid JSON array, no markdown. Each item: { "name": string, "amount": positive number }`;
 
-        const r = await ai.models.generateContent({
-            model: 'gemini-2.5-flash',
-            contents: prompt,
-            config: { responseMimeType: 'application/json' },
-        });
+        let r;
+        try {
+            // INITIALIZE AI WITH THE ACTIVE KEY
+            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
+            r = await ai.models.generateContent({
+                model: 'gemini-2.5-flash',
+                contents: prompt,
+                config: { responseMimeType: 'application/json' },
+            });
+        } catch (e) {
+             console.error('Gemini predict error:', e.message);
+             if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
+                 rotateKey();
+                 // We fail silently here so the frontend just tries again later without breaking the UI
+                 return res.json([]); 
+             }
+             throw e;
+        }
 
         let preds;
         try {
