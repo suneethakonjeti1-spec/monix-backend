@@ -97,16 +97,22 @@ else console.log(`✅ Loaded ${API_KEYS.length} Gemini key(s).`);
 
 // ─── RESILIENT AI ENGINE ───────────────────────────────────────
 // Round 1: all keys × gemini-2.5-flash  (your current model)
-// Round 2: all keys × gemini-1.5-flash  (separate Google servers, free)
+// Round 2: all keys × gemini-2.0-flash  (separate quota pool, v1beta compatible)
 // Round 3: Groq llama-3.1-70b           (completely different infra, free)
 // Exponential backoff between every attempt so Gemini has time to recover.
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const BACKOFF_MS  = [2000, 5000, 10000]; // wait before each next key attempt
-const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+const BACKOFF_MS    = [2000, 5000, 10000];
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
+
+// Errors that mean "overloaded — retry"
 const IS_OVERLOAD = msg => msg && (
     msg.includes('429') || msg.includes('503') ||
     msg.includes('RESOURCE_EXHAUSTED') || msg.includes('UNAVAILABLE')
+);
+// Errors that mean "wrong model name — skip this model entirely"
+const IS_MODEL_ERROR = msg => msg && (
+    msg.includes('404') || msg.includes('NOT_FOUND') || msg.includes('not found')
 );
 
 async function tryGemini(apiKey, model, prompt, config = {}) {
@@ -157,7 +163,11 @@ async function callAI(prompt, config = {}) {
                 return text;
             } catch (e) {
                 console.error(`❌ Attempt ${attempt} failed: ${e.message?.slice(0, 120)}`);
-                if (!IS_OVERLOAD(e.message)) throw e; // hard error — don't retry
+                if (IS_MODEL_ERROR(e.message)) {
+                    console.log(`⚠️  Model ${model} not available in this API version — skipping model.`);
+                    break; // skip remaining keys for this model, try next model
+                }
+                if (!IS_OVERLOAD(e.message)) throw e; // unexpected hard error
                 const wait = BACKOFF_MS[i] ?? 10000;
                 console.log(`⏳ Overload detected — waiting ${wait / 1000}s…`);
                 await sleep(wait);
