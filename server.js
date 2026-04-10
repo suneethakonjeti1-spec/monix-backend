@@ -84,32 +84,100 @@ const upload = multer({
     },
 });
 
-// ─── API KEY ROTATION ENGINE ───────────────────────────────────
-// Grabs the 3 keys from Render. If any are missing, it filters them out.
+// ─── API KEYS ──────────────────────────────────────────────────
 const API_KEYS = [
     process.env.GEMINI_KEY_1,
     process.env.GEMINI_KEY_2,
     process.env.GEMINI_KEY_3,
-    process.env.GEMINI_API_KEY // Fallback to your original key just in case
-].filter(key => key && key.trim() !== '');
+    process.env.GEMINI_API_KEY,
+].filter(k => k && k.trim() !== '');
 
-let currentKeyIndex = 0;
+if (API_KEYS.length === 0) console.error('🚨 CRITICAL: NO GEMINI API KEYS FOUND.');
+else console.log(`✅ Loaded ${API_KEYS.length} Gemini key(s).`);
 
-function getActiveKey() {
-    if (API_KEYS.length === 0) {
-        console.error("🚨 CRITICAL ERROR: NO API KEYS FOUND IN ENVIRONMENT VARIABLES.");
-        return null;
-    }
-    return API_KEYS[currentKeyIndex];
+// ─── RESILIENT AI ENGINE ───────────────────────────────────────
+// Round 1: all keys × gemini-2.5-flash  (your current model)
+// Round 2: all keys × gemini-1.5-flash  (separate Google servers, free)
+// Round 3: Groq llama-3.1-70b           (completely different infra, free)
+// Exponential backoff between every attempt so Gemini has time to recover.
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const BACKOFF_MS  = [2000, 5000, 10000]; // wait before each next key attempt
+const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-1.5-flash'];
+const IS_OVERLOAD = msg => msg && (
+    msg.includes('429') || msg.includes('503') ||
+    msg.includes('RESOURCE_EXHAUSTED') || msg.includes('UNAVAILABLE')
+);
+
+async function tryGemini(apiKey, model, prompt, config = {}) {
+    const ai = new GoogleGenAI({ apiKey });
+    const r  = await ai.models.generateContent({
+        model,
+        contents: typeof prompt === 'string'
+            ? [{ role: 'user', parts: [{ text: prompt }] }]
+            : prompt,
+        config,
+    });
+    return r.text;
 }
 
-function rotateKey() {
-    if (API_KEYS.length <= 1) return; // Can't rotate if we only have 1 key
-    currentKeyIndex++;
-    if (currentKeyIndex >= API_KEYS.length) {
-        currentKeyIndex = 0; // Loop back to the beginning
+async function tryGroq(prompt) {
+    const key = process.env.GROQ_API_KEY;
+    if (!key) throw new Error('No GROQ_API_KEY set.');
+    const text = typeof prompt === 'string' ? prompt
+        : prompt?.[0]?.parts?.[0]?.text ?? JSON.stringify(prompt);
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method : 'POST',
+        headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
+        body   : JSON.stringify({
+            model      : 'llama-3.1-70b-versatile',
+            messages   : [{ role: 'user', content: text }],
+            temperature: 0.1,
+        }),
+    });
+    if (!res.ok) throw new Error(`Groq ${res.status}`);
+    const data = await res.json();
+    return data.choices[0].message.content;
+}
+
+// Main entry — call this instead of touching GoogleGenAI directly.
+// prompt  : string or Gemini contents array
+// config  : e.g. { responseMimeType: 'application/json' }
+async function callAI(prompt, config = {}) {
+    let attempt = 0;
+
+    // Rounds 1 & 2 — Gemini (two models × all keys)
+    for (const model of GEMINI_MODELS) {
+        for (let i = 0; i < API_KEYS.length; i++) {
+            attempt++;
+            try {
+                console.log(`🤖 Attempt ${attempt}: ${model} key #${i + 1}`);
+                const text = await tryGemini(API_KEYS[i], model, prompt, config);
+                console.log(`✅ Success on attempt ${attempt}`);
+                return text;
+            } catch (e) {
+                console.error(`❌ Attempt ${attempt} failed: ${e.message?.slice(0, 120)}`);
+                if (!IS_OVERLOAD(e.message)) throw e; // hard error — don't retry
+                const wait = BACKOFF_MS[i] ?? 10000;
+                console.log(`⏳ Overload detected — waiting ${wait / 1000}s…`);
+                await sleep(wait);
+            }
+        }
+        console.log(`🔄 All keys exhausted for ${model}, trying next model…`);
     }
-    console.log(`🔄 AI Limit hit! Switched to API Key #${currentKeyIndex + 1}`);
+
+    // Round 3 — Groq fallback
+    try {
+        attempt++;
+        console.log(`🤖 Attempt ${attempt}: Groq llama-3.1-70b (final fallback)`);
+        const text = await tryGroq(prompt);
+        console.log('✅ Groq fallback succeeded.');
+        return text;
+    } catch (e) {
+        console.error(`❌ Groq failed: ${e.message}`);
+    }
+
+    throw new Error('All AI services are currently overloaded. Please try again in a few minutes.');
 }
 // ───────────────────────────────────────────────────────────────
 
@@ -207,23 +275,13 @@ ${text.slice(0, 15000)}`;
 
         let aiText;
         try {
-            // INITIALIZE AI WITH THE ACTIVE KEY
-            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
-            
-            const r = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: [{ role: 'user', parts: [{ text: prompt }] }],
-                config: { responseMimeType: 'application/json' },
-            });
-            aiText = r.text;
+            aiText = await callAI(
+                [{ role: 'user', parts: [{ text: prompt }] }],
+                { responseMimeType: 'application/json' }
+            );
         } catch (e) {
-            console.error('Gemini error:', e.message);
-            // CHECK FOR RATE LIMITS AND ROTATE
-            if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
-                rotateKey();
-                return res.status(502).json({ error: 'AI servers busy. Key rotated! Please click upload again.' });
-            }
-            return res.status(502).json({ error: 'AI service unavailable. Please try again shortly.' });
+            console.error('/upload AI error:', e.message);
+            return res.status(503).json({ error: e.message });
         }
 
         let parsed;
@@ -283,19 +341,15 @@ Context:
 
 Question: ${question}`;
 
+        let answer;
         try {
-            // INITIALIZE AI WITH THE ACTIVE KEY
-            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
-            const r = await ai.models.generateContent({ model: 'gemini-2.5-flash', contents: prompt });
-            res.json({ answer: r.text });
+            const text = await callAI(prompt);
+            answer = text;
         } catch (e) {
-            console.error('Gemini chat error:', e.message);
-            if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
-                rotateKey();
-                return res.status(502).json({ error: 'AI busy. Key rotated! Try asking again.' });
-            }
-            throw e; // pass to outer catch
+            console.error('/chat AI error:', e.message);
+            return res.status(503).json({ error: e.message });
         }
+        res.json({ answer });
 
     } catch (err) {
         console.error('/chat error:', err);
@@ -319,28 +373,17 @@ Rules:
 3. Use real names (e.g. "Netflix Subscription", "Electricity Bill", "Gym Membership").
 4. Return ONLY a valid JSON array, no markdown. Each item: { "name": string, "amount": positive number }`;
 
-        let r;
+        let rawText;
         try {
-            // INITIALIZE AI WITH THE ACTIVE KEY
-            const ai = new GoogleGenAI({ apiKey: getActiveKey() });
-            r = await ai.models.generateContent({
-                model: 'gemini-2.5-flash',
-                contents: prompt,
-                config: { responseMimeType: 'application/json' },
-            });
+            rawText = await callAI(prompt, { responseMimeType: 'application/json' });
         } catch (e) {
-             console.error('Gemini predict error:', e.message);
-             if (e.message && (e.message.includes('429') || e.message.includes('503') || e.message.includes('RESOURCE_EXHAUSTED'))) {
-                 rotateKey();
-                 // We fail silently here so the frontend just tries again later without breaking the UI
-                 return res.json([]); 
-             }
-             throw e;
+            console.error('/predict AI error:', e.message);
+            return res.json([]); // fail silently — predictions are non-critical
         }
 
         let preds;
         try {
-            preds = safeParseJSON(r.text);
+            preds = safeParseJSON(rawText);
             preds = preds
                 .filter(p => p?.name && typeof p.amount === 'number' && p.amount > 0)
                 .slice(0, 3)
@@ -363,8 +406,9 @@ app.use((err, _req, res, _next) => {
 // ─── Start ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`\n🚀 Monix Backend v2.1 | port ${PORT}`);
+    console.log(`\n🚀 Monix Backend v2.2 | port ${PORT}`);
     console.log(`   Health : http://localhost:${PORT}/health`);
     console.log(`   Auth   : ${adminInitialized ? 'Firebase Admin ✓' : 'DEV bypass'}`);
-    console.log(`   CORS   : ${ALLOWED_ORIGINS.join(', ')}\n`);
+    console.log(`   CORS   : ${ALLOWED_ORIGINS.join(', ')}`);
+    console.log(`   AI     : ${API_KEYS.length} Gemini key(s) + ${process.env.GROQ_API_KEY ? 'Groq ✓' : 'Groq ✗ (add GROQ_API_KEY)'}\n`);
 });
