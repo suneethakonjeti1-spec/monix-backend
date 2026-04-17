@@ -96,21 +96,14 @@ if (API_KEYS.length === 0) console.error('🚨 CRITICAL: NO GEMINI API KEYS FOUN
 else console.log(`✅ Loaded ${API_KEYS.length} Gemini key(s).`);
 
 // ─── RESILIENT AI ENGINE ───────────────────────────────────────
-// Round 1: all keys × gemini-2.5-flash  (your current model)
-// Round 2: all keys × gemini-2.0-flash  (separate quota pool, v1beta compatible)
-// Round 3: Groq llama-3.1-70b           (completely different infra, free)
-// Exponential backoff between every attempt so Gemini has time to recover.
-
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const BACKOFF_MS    = [2000, 5000, 10000];
 const GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.0-flash'];
 
-// Errors that mean "overloaded — retry"
 const IS_OVERLOAD = msg => msg && (
     msg.includes('429') || msg.includes('503') ||
     msg.includes('RESOURCE_EXHAUSTED') || msg.includes('UNAVAILABLE')
 );
-// Errors that mean "wrong model name — skip this model entirely"
 const IS_MODEL_ERROR = msg => msg && (
     msg.includes('404') || msg.includes('NOT_FOUND') || msg.includes('not found')
 );
@@ -127,17 +120,28 @@ async function tryGemini(apiKey, model, prompt, config = {}) {
     return r.text;
 }
 
+// ✅ FIXED GROQ FUNCTION
 async function tryGroq(prompt) {
     const key = process.env.GROQ_API_KEY;
     if (!key) throw new Error('No GROQ_API_KEY set.');
-    const text = typeof prompt === 'string' ? prompt
+    
+    let text = typeof prompt === 'string' ? prompt
         : prompt?.[0]?.parts?.[0]?.text ?? JSON.stringify(prompt);
+
+    // Slice text to prevent 400 errors from massive files
+    if (text.length > 8000) {
+        text = text.slice(0, 8000);
+    }
+
     const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
         method : 'POST',
         headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
         body   : JSON.stringify({
-            model      : 'llama-3.1-70b-versatile',
-            messages   : [{ role: 'user', content: text }],
+            model      : 'llama-3.1-8b-instant', // Correct, fast model
+            messages   : [
+                { role: 'system', content: 'You are a data extractor. Return ONLY a valid JSON array of transaction objects. No explanations or markdown wrappers.' },
+                { role: 'user', content: text }
+            ],
             temperature: 0.1,
         }),
     });
@@ -146,13 +150,9 @@ async function tryGroq(prompt) {
     return data.choices[0].message.content;
 }
 
-// Main entry — call this instead of touching GoogleGenAI directly.
-// prompt  : string or Gemini contents array
-// config  : e.g. { responseMimeType: 'application/json' }
 async function callAI(prompt, config = {}) {
     let attempt = 0;
 
-    // Rounds 1 & 2 — Gemini (two models × all keys)
     for (const model of GEMINI_MODELS) {
         for (let i = 0; i < API_KEYS.length; i++) {
             attempt++;
@@ -165,9 +165,9 @@ async function callAI(prompt, config = {}) {
                 console.error(`❌ Attempt ${attempt} failed: ${e.message?.slice(0, 120)}`);
                 if (IS_MODEL_ERROR(e.message)) {
                     console.log(`⚠️  Model ${model} not available in this API version — skipping model.`);
-                    break; // skip remaining keys for this model, try next model
+                    break;
                 }
-                if (!IS_OVERLOAD(e.message)) throw e; // unexpected hard error
+                if (!IS_OVERLOAD(e.message)) throw e;
                 const wait = BACKOFF_MS[i] ?? 10000;
                 console.log(`⏳ Overload detected — waiting ${wait / 1000}s…`);
                 await sleep(wait);
@@ -176,10 +176,9 @@ async function callAI(prompt, config = {}) {
         console.log(`🔄 All keys exhausted for ${model}, trying next model…`);
     }
 
-    // Round 3 — Groq fallback
     try {
         attempt++;
-        console.log(`🤖 Attempt ${attempt}: Groq llama-3.1-70b (final fallback)`);
+        console.log(`🤖 Attempt ${attempt}: Groq llama-3.1-8b-instant (final fallback)`);
         const text = await tryGroq(prompt);
         console.log('✅ Groq fallback succeeded.');
         return text;
@@ -193,7 +192,7 @@ async function callAI(prompt, config = {}) {
 
 // ─── Auth Middleware ───────────────────────────────────────────
 async function requireAuth(req, res, next) {
-    if (!adminInitialized) return next(); // dev mode bypass
+    if (!adminInitialized) return next(); 
 
     const header = req.headers.authorization;
     if (!header?.startsWith('Bearer ')) {
@@ -232,7 +231,7 @@ app.get('/health', (_req, res) => {
         status: 'ok',
         timestamp: new Date().toISOString(),
         auth: adminInitialized ? 'firebase-admin' : 'dev-bypass',
-        version: '2.1.0',
+        version: '2.2.0',
         activeKeysCount: API_KEYS.length
     });
 });
@@ -250,7 +249,7 @@ app.post('/upload', uploadLimiter, requireAuth, upload.single('pdfFile'), async 
             text = await extractTextFromPDF(req.file.buffer);
         } catch {
             return res.status(422).json({
-                error: 'Could not read this PDF. Only text-based PDFs are supported — scanned images won\'t work.',
+                error: 'Could not read this PDF. Only text-based PDFs are supported.',
             });
         }
 
@@ -258,29 +257,30 @@ app.post('/upload', uploadLimiter, requireAuth, upload.single('pdfFile'), async 
             return res.status(422).json({ error: 'PDF appears empty or has no readable text.' });
         }
 
-        const prompt = `You are an expert financial AI specializing in Indian bank statements.
-Extract ALL transactions from the text. Follow these rules exactly:
+        // ✅ STRONGER, MORE RELIABLE PROMPT
+        const prompt = `You are a precision financial data extraction AI. Process this Indian bank statement text and extract all transactions into a structured JSON array.
 
-CRITICAL RULES FOR DEBITS vs CREDITS:
-The text columns are mixed up. You MUST use the running balance (the last number in the row) to determine if the transaction amount is a Debit (-) or Credit (+).
-1. If the balance DECREASES from the previous row = DEBIT (return as a NEGATIVE number).
-2. If the balance INCREASES from the previous row = CREDIT (return as a POSITIVE number).
+CRITICAL LOGIC FOR DEBIT VS CREDIT:
+Bank statement columns are often misaligned. You MUST use the RUNNING BALANCE (the last number in a row) to determine the sign:
+1. If the running balance DECREASES from the previous transaction, it is a DEBIT. Return the amount as a NEGATIVE number (e.g., -500).
+2. If the running balance INCREASES from the previous transaction, it is a CREDIT. Return the amount as a POSITIVE number (e.g., 500).
 
-OPENING BALANCE INSTRUCTION:
-3. You MUST include the "OPENING BALANCE" as the very first transaction. Treat it as a POSITIVE number (Credit) and categorize it as "Other".
-4. Ignore "CLOSING BALANCE" and "TRANSACTION TOTAL" rows.
+INCLUSION RULES:
+3. OPENING BALANCE: If present, include it as the first transaction. Amount is POSITIVE. Category: "Other".
+4. IGNORE: "Closing Balance", "Transaction Total", "B/F", "C/F", or header rows. Include ONLY actual transactions.
 
-CONTEXT CLUES (Axis Bank):
-- "UPI/P2M", "UPI/P2A", "Car ch", "Tifin" are almost always DEBITS (-)
-- "ACH-CR", "Int.Pd", and "RTGS/NEFT...LOAN RETURN" are CREDITS (+)
+CATEGORIZATION RULES:
+5. Assign EXACTLY ONE category from this list: "Utilities", "Salary", "Food & Dining", "Shopping", "Auto & Transport", "Entertainment", "Transfers & Loans", "Groceries", "UPI Payment", "Other".
+6. Context Clues: "UPI/P2M", "Zomato", "Swiggy" -> Food/Groceries. "ACH-CR", "SALARY" -> Salary. "EMI", "LOAN" -> Transfers & Loans.
 
-OTHER RULES:
-5. Assign exactly one category from: "Utilities" | "Salary" | "Food & Dining" | "Shopping" | "Auto & Transport" | "Entertainment" | "Transfers & Loans" | "Groceries" | "UPI Payment" | "Other"
-6. Date format: YYYY-MM-DD.
-7. description: plain text only, no quotes, max 120 chars.
-8. Return ONLY a valid JSON array. No markdown. Each item: { "date", "description", "amount", "category" }
+FORMATTING RULES:
+7. Date: YYYY-MM-DD format only.
+8. Description: Clean, plain text. Remove excess spaces or asterisks. Max 100 characters.
+9. Amount: Float/Number type, no currency symbols or commas.
+10. OUTPUT: Return ONLY a valid JSON array of objects. No markdown.
+Example: [{"date": "2024-03-01", "description": "OPENING BALANCE", "amount": 15000.00, "category": "Other"}]
 
-Statement:
+Statement Data:
 ${text.slice(0, 15000)}`;
 
         let aiText;
@@ -299,7 +299,7 @@ ${text.slice(0, 15000)}`;
             parsed = safeParseJSON(aiText);
         } catch {
             console.error('JSON parse failed. Raw:', aiText?.slice(0, 300));
-            return res.status(422).json({ error: 'AI returned malformed data. Please retry — complex PDFs sometimes need a second attempt.' });
+            return res.status(422).json({ error: 'AI returned malformed data. Please retry.' });
         }
 
         const clean = parsed
@@ -320,7 +320,6 @@ ${text.slice(0, 15000)}`;
     }
 });
 
-// Multer error handler
 app.use((err, req, res, next) => {
     if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `File too large (max ${MAX_MB} MB).` });
     if (err.message === 'Only PDF files are accepted.') return res.status(400).json({ error: err.message });
@@ -388,7 +387,7 @@ Rules:
             rawText = await callAI(prompt, { responseMimeType: 'application/json' });
         } catch (e) {
             console.error('/predict AI error:', e.message);
-            return res.json([]); // fail silently — predictions are non-critical
+            return res.json([]); 
         }
 
         let preds;
@@ -407,7 +406,6 @@ Rules:
     }
 });
 
-// ─── Global error handler ──────────────────────────────────────
 app.use((err, _req, res, _next) => {
     console.error('Unhandled error:', err);
     res.status(500).json({ error: 'Internal server error.' });
